@@ -1,3 +1,4 @@
 requests~=2.32.5
 gradio~=5.46.1
 python-dotenv
+boto3
