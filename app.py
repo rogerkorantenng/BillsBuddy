@@ -1,10 +1,7 @@
 # app.py
 # Bills & Subscriptions Buddy (Gradio)
-# - Upload bill (image/PDF) → S3 via presign → /tools/extract (OCR+LLM)
-# - Schedule reminders via /tools/schedule
-# - Get mock payment link via /tools/pay
-# - Chat with Bedrock Agent via Lambda endpoint /agent/chat (no local AWS creds)
-#   Agent tab supports attaching a file: we upload it to S3 and include an s3:// hint.
+# UI polish + improved History (table + picker + details + CSV export)
+# No feature changes: endpoints & flows remain the same.
 
 import os
 import json
@@ -39,6 +36,55 @@ AGENT_CHAT_URL = f"{API_BASE}/agent/chat"     if API_BASE else None
 
 AGENT_SESSION = str(uuid.uuid4())  # one chat session per app run
 
+# --- Minimal CSS for a nicer UI ---
+CUSTOM_CSS = """
+:root {
+  --bb-card-bg: #f9fafb;
+  --bb-muted:   #6b7280;
+  --bb-border:  #d1d5db;
+  --bb-text:    #111827;
+  --bb-accent:  #2563eb;
+}
+
+/* dark-mode fallback */
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bb-card-bg: #111827;
+    --bb-border:  #374151;
+    --bb-text:    #f3f4f6;
+  }
+}
+
+.bb-card{
+  border:1px solid var(--bb-border);
+  border-radius:14px;
+  padding:16px;
+  background:var(--bb-card-bg);
+  box-shadow:0 1px 2px rgba(0,0,0,.06);
+  color:var(--bb-text);
+  min-height: 96px;
+}
+
+/* ensure inner text isn't inheriting invisible theme colors */
+.bb-card, .bb-card * {
+  color: var(--bb-text) !important;
+}
+
+.bb-grid{display:grid; grid-template-columns:1fr 1fr; gap:10px;}
+.bb-kv{display:flex; justify-content:space-between; gap:12px; padding:6px 0; border-bottom:1px dashed var(--bb-border);}
+.bb-kv span:first-child{color:var(--bb-muted) !important;}
+.bb-badge{display:inline-block; font-size:12px; padding:3px 8px; border-radius:999px; border:1px solid var(--bb-border);}
+.bb-badge.ok{background: black;}
+.bb-badge.err{background: black;}
+.bb-mono{font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono","Courier New", monospace; font-size:12px;}
+.bb-section-title{font-weight:600; margin:8px 0 4px;}
+a.bb-btn{display:inline-block; padding:8px 12px; border:1px solid var(--bb-border); border-radius:10px; text-decoration:none;}
+
+/* History table container cap */
+#hist_table { max-height: 220px; overflow: auto; }
+"""
+
+
 # --- Helpers ---
 
 def _pretty_json(o):
@@ -53,33 +99,50 @@ def _hash_name(name: str) -> str:
     h = hashlib.sha1(f"{base}-{stamp}".encode()).hexdigest()[:10]
     return f"uploads/{stamp}-{h}-{base}"
 
-SUMMARY_TMPL = (
-    """
-### 🧾 Bill Summary
-- **Provider:** {provider}
-- **Amount:** {amount} {currency}
-- **Due date:** {due_date}
-- **Account #:** {account_number}
-- **Period:** {period_start} → {period_end}
-- **Penalties:** {penalties}
+def _fmt_amount(a, c):
+    if a is None: return "—"
+    try:
+        return f"{float(a):,.2f} {c or ''}".strip()
+    except Exception:
+        return f"{a} {c or ''}".strip()
 
-> {notes}
+def _fmt_date(d):
+    return d or "—"
+
+SUMMARY_TMPL_HTML = """
+<div class="bb-card">
+  <div class="bb-grid">
+    <div>
+      <div class="bb-section-title">🧾 Bill Summary</div>
+      <div class="bb-kv"><span>Provider</span><span><strong>{provider}</strong></span></div>
+      <div class="bb-kv"><span>Amount</span><span><strong>{amount_fmt}</strong></span></div>
+      <div class="bb-kv"><span>Due date</span><span><strong>{due_date_fmt}</strong></span></div>
+      <div class="bb-kv"><span>Account #</span><span>{account_number}</span></div>
+    </div>
+    <div>
+      <div class="bb-section-title">Details</div>
+      <div class="bb-kv"><span>Period</span><span>{period_start_fmt} → {period_end_fmt}</span></div>
+      <div class="bb-kv"><span>Penalties</span><span>{penalties}</span></div>
+      <div class="bb-kv"><span>Currency</span><span>{currency}</span></div>
+    </div>
+  </div>
+  <div style="margin-top:10px; color:var(--bb-muted);">{notes}</div>
+</div>
 """
-)
 
-def make_summary_md(data: dict) -> str:
+def make_summary_html(data: dict) -> str:
     safe = {
         'provider': data.get('provider') or '—',
-        'amount': data.get('amount') if data.get('amount') is not None else '—',
+        'amount_fmt': _fmt_amount(data.get('amount'), data.get('currency')),
         'currency': data.get('currency') or '—',
-        'due_date': data.get('due_date') or '—',
+        'due_date_fmt': _fmt_date(data.get('due_date')),
         'account_number': data.get('account_number') or '—',
-        'period_start': data.get('period_start') or '—',
-        'period_end': data.get('period_end') or '—',
-        'penalties': data.get('penalties') if data.get('penalties') is not None else '—',
-        'notes': data.get('notes') or '—',
+        'period_start_fmt': _fmt_date(data.get('period_start')),
+        'period_end_fmt': _fmt_date(data.get('period_end')),
+        'penalties': '—' if data.get('penalties') is None else data.get('penalties'),
+        'notes': data.get('notes') or '',
     }
-    return SUMMARY_TMPL.format(**safe)
+    return SUMMARY_TMPL_HTML.format(**safe)
 
 # Health check (use /tools/pay so health works even if extract is WIP)
 def api_health():
@@ -101,14 +164,12 @@ def presign_upload(key: str, content_type: str):
         timeout=20
     )
     if r.status_code != 200:
-        # bubble up the lambda's error body so you can see what's wrong
         try:
             detail = r.json()
         except Exception:
             detail = {"raw": r.text}
         raise RuntimeError(f"Presign failed {r.status_code}: {detail}")
     return r.json()
-
 
 def upload_bytes_to_presigned(presigned, data: bytes, content_type: str):
     if "fields" in presigned:  # POST form style
@@ -192,8 +253,36 @@ END:VCALENDAR
         f.write(ics)
     return path
 
+# --- History (session-scoped) ---
+HISTORY = []  # list of {id, ts, provider, due_date, amount, currency, data}
+
+def _push_history(data: dict):
+    entry = {
+        "id": str(uuid.uuid4())[:8],
+        "ts": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "provider": data.get("provider"),
+        "due_date": data.get("due_date"),
+        "amount": data.get("amount"),
+        "currency": data.get("currency"),
+        "data": data
+    }
+    HISTORY.insert(0, entry)  # newest first
+
+def _history_rows_and_choices():
+    rows = [{"when": e["ts"], "provider": e["provider"], "due_date": e["due_date"],
+             "amount": e["amount"], "currency": e["currency"], "id": e["id"]} for e in HISTORY]
+    # dropdown choices: label shows time + provider + amount
+    choices = [ (e["id"], f'{e["ts"]} — {e.get("provider") or "?"} — { _fmt_amount(e.get("amount"), e.get("currency")) }')
+               for e in HISTORY ]
+    return rows, choices
+
+def _history_get(id_):
+    for e in HISTORY:
+        if e["id"] == id_:
+            return e
+    return None
+
 # --- Gradio callbacks ---
-HISTORY = []  # session-scoped list of summaries
 
 def understand_bill(file, text_input, state):
     if not API_BASE:
@@ -223,21 +312,18 @@ def understand_bill(file, text_input, state):
         if err:
             return "", _pretty_json(err), {}, state
 
-    summary_md = make_summary_md(data)
+    # Summary + state
+    summary_html = make_summary_html(data)
     state = data
+
+    # If nothing found, show OCR preview in error box
     missing_all = not any([data.get("provider"), data.get("amount"), data.get("currency"), data.get("due_date")])
     if missing_all and data.get("text_preview"):
         preview = data["text_preview"][:1200]
-        # Put the OCR text into the “Errors” box so you can see what was read
-        return summary_md, "⚠️ Couldn’t find key fields. OCR saw:\n\n```\n" + preview + "\n```", data, state
+        return summary_html, "⚠️ Couldn’t find key fields. OCR saw:\n\n```\n" + preview + "\n```", data, state
 
-    HISTORY.append({
-        "provider": data.get("provider"),
-        "due_date": data.get("due_date"),
-        "amount": data.get("amount"),
-        "currency": data.get("currency"),
-    })
-    return summary_md, "", data, state
+    _push_history(data)
+    return summary_html, "", data, state
 
 def smart_schedule(state, user_id, bill_id, offsets_str, hour):
     if not state:
@@ -273,18 +359,19 @@ def pay_markdown(provider, amount, currency):
         return "❌ Amount must be a number (e.g., 120.50)."
     data, err = call_pay(provider or "UNKNOWN", amt, currency or "USD")
     if err:
-        # <<< fixed: no ```json fence >>>
         return f"❌ Payment API error:\n\n```\n{_pretty_json(err)}\n```"
     url = data.get("url"); ref = data.get("reference")
     return (
-        f"**Payment Link:** [{url}]({url})\n\n"
-        f"**Reference:** `{ref}`\n\n"
-        f"**Amount:** {data.get('amount')} {data.get('currency')}\n\n"
-        f"**Provider:** {data.get('provider')}"
+        f"<div class='bb-card'>"
+        f"<div class='bb-section-title'>Payment</div>"
+        f"<div class='bb-kv'><span>Link</span><span><a class='bb-btn' href='{url}' target='_blank' rel='noopener'>Open payment page</a></span></div>"
+        f"<div class='bb-kv'><span>Reference</span><span class='bb-mono'>{ref}</span></div>"
+        f"<div class='bb-kv'><span>Amount</span><span><strong>{_fmt_amount(data.get('amount'), data.get('currency'))}</strong></span></div>"
+        f"<div class='bb-kv'><span>Provider</span><span>{data.get('provider')}</span></div>"
+        f"</div>"
     )
 
 # Agent chat via Lambda endpoint (with optional file attachment)
-
 def agent_chat(message: str):
     if not AGENT_CHAT_URL:
         return "Configure API_BASE/agent/chat first."
@@ -295,16 +382,12 @@ def agent_chat(message: str):
                 err = r.json()
             except Exception:
                 err = {"error": r.text}
-            # <<< fixed: no ```json fence >>>
             return f"❌ Agent API error:\n\n```\n{_pretty_json(err)}\n```"
         return r.json().get("reply", "(no reply)")
     except Exception as e:
         return f"❌ Agent request failed: {e}"
 
 def agent_chat_with_optional_file(user_msg, file_path):
-    """If a file is attached, upload to S3 and append an instruction with s3:// location.
-    The agent (via action group) should then call /tools/extract with that bucket+key.
-    """
     message = (user_msg or "").strip()
     if file_path:
         try:
@@ -317,7 +400,6 @@ def agent_chat_with_optional_file(user_msg, file_path):
             ps = presign_upload(key, ctype)
             upload_bytes_to_presigned(ps, content, ctype)
             s3_uri = f"s3://{UPLOAD_BUCKET}/{key}"
-            # Nudge the agent to use the extract tool with bucket/key
             hint = (
                 f"\n\nAttachment: {s3_uri}\n"
                 f"Use the extract tool by calling POST /tools/extract with JSON "
@@ -329,18 +411,13 @@ def agent_chat_with_optional_file(user_msg, file_path):
     return agent_chat(message)
 
 # --- UI ---
-with gr.Blocks(title="Bills Buddy (Gradio)") as demo:
-    gr.Markdown(
-        """
-        # Bills & Subscriptions Buddy
-        Extract bill fields → schedule reminders → get a mock payment link.
-        Polished UI: summary card, JSON viewer, Smart Schedule, calendar export, and Agent chat.
-        """
-    )
+with gr.Blocks(title="Bills Buddy (Gradio)", css=CUSTOM_CSS) as demo:
+    gr.Markdown("# Bills & Subscriptions Buddy")
 
-    with gr.Row():
-        ok, msg = api_health()
-        gr.Markdown(f"**API status:** {'✅' if ok else '❌'} {msg}")
+    # Status strip
+    ok, msg = api_health()
+    status_badge = f"<span class='bb-badge {'ok' if ok else 'err'}'>{'✅' if ok else '❌'} {msg}</span>"
+    gr.HTML(f"<div>API status: {status_badge}</div>")
 
     state = gr.State({})
 
@@ -348,14 +425,17 @@ with gr.Blocks(title="Bills Buddy (Gradio)") as demo:
         with gr.Row():
             with gr.Column(scale=1):
                 file = gr.File(label="Upload bill (image/PDF)", type="filepath")
-                text_input = gr.Textbox(label="Or paste bill text", lines=8)
+                text_input = gr.Textbox(label="Or paste bill text", lines=8, placeholder="Paste bill text here...")
                 btn = gr.Button("Understand", variant="primary")
             with gr.Column(scale=1):
-                summary_md = gr.Markdown(value="")
+                summary_html = gr.HTML(value="")
                 error_md = gr.Markdown(value="")
         with gr.Accordion("Full extracted JSON", open=False):
             full_json = gr.JSON(value={})
-        btn.click(understand_bill, inputs=[file, text_input, state], outputs=[summary_md, error_md, full_json, state])
+
+        # Main flow
+        ev = btn.click(understand_bill, inputs=[file, text_input, state],
+                       outputs=[summary_html, error_md, full_json, state])
 
     with gr.Tab("Schedule & Calendar"):
         with gr.Row():
@@ -380,15 +460,54 @@ with gr.Blocks(title="Bills Buddy (Gradio)") as demo:
             amount = gr.Number(label="Amount", value=120.50, precision=2)
             currency = gr.Textbox(label="Currency (ISO)", value="GHS")
         btn3 = gr.Button("Get Payment Link")
-        pay_out = gr.Markdown(label="Payment")
+        pay_out = gr.HTML(label="Payment")
         btn3.click(pay_markdown, inputs=[provider, amount, currency], outputs=[pay_out])
 
+    # -------- Improved History --------
     with gr.Tab("History"):
-        gr.Markdown("Recent extractions (this session only)")
-        hist = gr.Dataframe(headers=["provider","due_date","amount","currency"], row_count=(0, "dynamic"))
-        def _refresh_hist(_1,_2,_3,_state):
-            return HISTORY
-        btn.click(_refresh_hist, inputs=[file, text_input, full_json, state], outputs=[hist])
+        gr.Markdown("Session history of extractions")
+        hist_table = gr.Dataframe(
+            headers=["when","provider","due_date","amount","currency","id"],
+            row_count=(0, "dynamic"),
+            interactive=False, wrap=False,
+            elem_id="hist_table"   # CSS scroll cap
+        )
+        hist_pick = gr.Dropdown(label="View details", choices=[], value=None)
+        hist_view = gr.HTML(label="Selected summary")
+        hist_json = gr.JSON(label="Selected JSON", value={})
+
+        def _refresh_hist():
+            rows, choices = _history_rows_and_choices()
+            return rows, choices
+
+        def _on_pick(item_id):
+            if not item_id:
+                return "", {}
+            e = _history_get(item_id)
+            if not e:
+                return "", {}
+            return make_summary_html(e["data"]), e["data"]
+
+        # After each Understand, refresh history table + picker
+        ev.then(_refresh_hist, inputs=None, outputs=[hist_table, hist_pick])
+        # When a user picks an item, show summary+json
+        hist_pick.change(_on_pick, inputs=[hist_pick], outputs=[hist_view, hist_json])
+
+        # Export CSV
+        def _export_csv():
+            import csv
+            fd, path = tempfile.mkstemp(prefix="billsbuddy_history_", suffix=".csv")
+            cols = ["when","provider","due_date","amount","currency","id"]
+            with os.fdopen(fd, "w", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                w.writerow(cols)
+                for r in _history_rows_and_choices()[0]:
+                    w.writerow([r.get(c,"") for c in cols])
+            return path
+
+        csv_btn = gr.Button("Download history (.csv)")
+        csv_file = gr.File(label="CSV", interactive=False)
+        csv_btn.click(_export_csv, inputs=None, outputs=[csv_file])
 
     with gr.Tab("Chat with Agent"):
         gr.Markdown("Talk to your BillsBuddy agent (Lambda). Attach a bill or just type.")
