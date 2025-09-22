@@ -627,7 +627,7 @@ with gr.Blocks(title="Bills Buddy (Gradio)", css=CUSTOM_CSS) as demo:
             interactive=False, wrap=False,
             elem_id="hist_table"   # CSS scroll cap
         )
-        hist_pick = gr.Dropdown(label="View details", choices=[], value=None)
+        hist_pick = gr.Dropdown()
         hist_view = gr.HTML(label="Selected summary")
         hist_json = gr.JSON(label="Selected JSON", value={})
 
