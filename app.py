@@ -1,7 +1,7 @@
 # app.py
 # Bills & Subscriptions Buddy (Gradio)
 # UI polish + improved History (table + picker + details + CSV export)
-# No feature changes: endpoints & flows remain the same.
+# Smart Schedule now renders both legacy shape and {"plan":[...]} nicely.
 
 import os
 import json
@@ -10,6 +10,7 @@ import uuid
 import hashlib
 import mimetypes
 import tempfile
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -84,7 +85,6 @@ a.bb-btn{display:inline-block; padding:8px 12px; border:1px solid var(--bb-borde
 #hist_table { max-height: 220px; overflow: auto; }
 """
 
-
 # --- Helpers ---
 
 def _pretty_json(o):
@@ -143,6 +143,162 @@ def make_summary_html(data: dict) -> str:
         'notes': data.get('notes') or '',
     }
     return SUMMARY_TMPL_HTML.format(**safe)
+
+# --- Plan rendering (supports old shape and {"plan":[...]}) ---
+
+def _parse_iso(s: str):
+    if not s:
+        return None
+    try:
+        if isinstance(s, str) and s.endswith("Z"):
+            return datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return datetime.fromisoformat(str(s))
+    except Exception:
+        return None
+
+def _fmt_dt(s: str) -> str:
+    """Best-effort ISO → friendly. Falls back to raw string."""
+    if not s:
+        return "—"
+    dt = _parse_iso(s)
+    if not dt:
+        # try date-only like YYYY-MM-DD
+        try:
+            if re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(s)):
+                dt2 = datetime.fromisoformat(str(s))
+                return dt2.strftime("%a, %d %b %Y")
+        except Exception:
+            pass
+        return str(s)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.strftime("%a, %d %b %Y %H:%M %Z")
+
+def render_plan_html(plan: dict) -> str:
+    """Render schedule plan from either:
+       - legacy shape with due_date/hour/offsets/reminders
+       - new shape with {'plan': [{when,type,offset_days}, ...]}
+    """
+    if not isinstance(plan, dict):
+        return (
+            "<div class='bb-card'><div class='bb-section-title'>Plan</div>"
+            f"<pre class='bb-mono'>{_pretty_json(plan)}</pre></div>"
+        )
+
+    if "error" in plan:
+        return (
+            "<div class='bb-card'>"
+            "<div class='bb-section-title'>Plan</div>"
+            "<div class='bb-kv'><span>Status</span><span>❌ Error</span></div>"
+            f"<pre class='bb-mono'>{_pretty_json(plan['error'])}</pre>"
+            "</div>"
+        )
+
+    # 1) List of items under common keys (incl. 'plan')
+    reminders = None
+    for k in ("reminders", "schedules", "items", "events", "plan"):
+        if isinstance(plan.get(k), list):
+            reminders = plan.get(k)
+            break
+    reminders = reminders or []
+
+    # 2) Top-level metadata if present
+    due   = plan.get("due_date") or plan.get("dueDate")
+    user  = plan.get("userId") or plan.get("user") or "—"
+    bill  = plan.get("billId") or plan.get("bill") or "—"
+    hour  = plan.get("hour")
+    offs  = plan.get("offsets_days") or plan.get("offsetsDays") or plan.get("offsets")
+
+    # 3) Derive missing fields
+    due_dt = None
+    if not due and reminders:
+        zero_items = [r for r in reminders
+                      if isinstance(r, dict) and (r.get("offset_days") == 0 or str(r.get("type","")).lower() in ("due-day","due","final"))]
+        candidates = zero_items or reminders
+        dts = []
+        for r in candidates:
+            ts = None
+            if isinstance(r, dict):
+                ts = r.get("when") or r.get("datetime") or r.get("time") or r.get("scheduled_for")
+            dt = _parse_iso(ts)
+            if dt:
+                dts.append(dt)
+        if dts:
+            due_dt = max(dts)
+            due = due_dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    if hour is None:
+        src_dt = due_dt
+        if not src_dt and reminders:
+            first_ts = reminders[0].get("when") if isinstance(reminders[0], dict) else None
+            src_dt = _parse_iso(first_ts)
+        if src_dt:
+            hour = src_dt.hour
+
+    if offs is None:
+        offs_set = []
+        for r in reminders:
+            if isinstance(r, dict) and r.get("offset_days") is not None:
+                try:
+                    v = int(r.get("offset_days"))
+                    if v not in offs_set:
+                        offs_set.append(v)
+                except Exception:
+                    pass
+        offs = sorted(offs_set) if offs_set else None
+
+    # 4) Build rows
+    rows_html_parts = []
+    def _pick_ts(d):
+        if not isinstance(d, dict):
+            return None
+        for k in ("when","runAt","schedule_time","scheduleTime","execute_at",
+                  "scheduled_for","date","datetime","ts","time"):
+            if k in d:
+                return d.get(k)
+        for v in d.values():
+            if isinstance(v, str) and re.search(r"\d{4}-\d{2}-\d{2}", v):
+                return v
+        return None
+
+    for idx, r in enumerate(reminders, 1):
+        ts = _pick_ts(r)
+        nice = _fmt_dt(ts)
+        rid = (r.get("id") or r.get("pk") or r.get("name") or f"#{idx}") if isinstance(r, dict) else f"#{idx}"
+        status = (r.get("status") if isinstance(r, dict) else "") or ""
+        rtype  = (r.get("type") if isinstance(r, dict) else "") or ""
+        odst   = None
+        if isinstance(r, dict) and r.get("offset_days") is not None:
+            try:
+                odst = int(r["offset_days"])
+            except Exception:
+                pass
+
+        rid_html    = f" &nbsp; <span class='bb-mono'>{rid}</span>" if rid else ""
+        status_html = f" &nbsp; ({status})" if status else ""
+        type_html   = f" &nbsp; <span class='bb-mono'>{rtype}</span>" if rtype else ""
+        off_html    = f" &nbsp; <span class='bb-mono'>[{odst:+}d]</span>" if isinstance(odst, int) else ""
+
+        rows_html_parts.append(
+            f"<div class='bb-kv'><span>Reminder {idx}</span>"
+            f"<span><strong>{nice}</strong>{rid_html}{type_html}{off_html}{status_html}</span></div>"
+        )
+
+    offs_txt = ", ".join(str(x) for x in offs) if isinstance(offs, (list, tuple)) and offs else "—"
+    hour_txt = f"{int(hour):02d}:00" if isinstance(hour, (int, float)) else (hour or "—")
+    rows_block = "".join(rows_html_parts) if rows_html_parts else "<div style='margin-top:8px; color:var(--bb-muted)'>No individual reminder rows returned.</div>"
+
+    return (
+        "<div class='bb-card'>"
+        "<div class='bb-section-title'>🔔 Reminder Plan</div>"
+        f"<div class='bb-kv'><span>Due date</span><span><strong>{_fmt_dt(due)}</strong></span></div>"
+        f"<div class='bb-kv'><span>User</span><span>{user}</span></div>"
+        f"<div class='bb-kv'><span>Bill</span><span>{bill}</span></div>"
+        f"<div class='bb-kv'><span>Daily hour</span><span>{hour_txt}</span></div>"
+        f"<div class='bb-kv'><span>Offsets (days)</span><span>{offs_txt}</span></div>"
+        f"{rows_block}"
+        "</div>"
+    )
 
 # Health check (use /tools/pay so health works even if extract is WIP)
 def api_health():
@@ -271,7 +427,6 @@ def _push_history(data: dict):
 def _history_rows_and_choices():
     rows = [{"when": e["ts"], "provider": e["provider"], "due_date": e["due_date"],
              "amount": e["amount"], "currency": e["currency"], "id": e["id"]} for e in HISTORY]
-    # dropdown choices: label shows time + provider + amount
     choices = [ (e["id"], f'{e["ts"]} — {e.get("provider") or "?"} — { _fmt_amount(e.get("amount"), e.get("currency")) }')
                for e in HISTORY ]
     return rows, choices
@@ -312,11 +467,9 @@ def understand_bill(file, text_input, state):
         if err:
             return "", _pretty_json(err), {}, state
 
-    # Summary + state
     summary_html = make_summary_html(data)
     state = data
 
-    # If nothing found, show OCR preview in error box
     missing_all = not any([data.get("provider"), data.get("amount"), data.get("currency"), data.get("due_date")])
     if missing_all and data.get("text_preview"):
         preview = data["text_preview"][:1200]
@@ -327,16 +480,18 @@ def understand_bill(file, text_input, state):
 
 def smart_schedule(state, user_id, bill_id, offsets_str, hour):
     if not state:
-        return "Run Understand first."
+        return "<div class='bb-card'>Run <strong>Understand</strong> first.</div>"
     due = state.get("due_date")
     if not due:
-        return "No due date extracted. Enter it manually on the Schedule tab."
+        return "<div class='bb-card'>No due date extracted. Enter it manually on the Schedule tab.</div>"
     try:
         offsets = [int(x.strip()) for x in offsets_str.split(',') if x.strip()]
     except Exception:
         offsets = [7,3,0]
+
     data, err = call_schedule(due, user_id or "demo", bill_id or "bill-001", tuple(offsets), int(hour or 9))
-    return _pretty_json(err or data)
+    plan = err or data or {}
+    return render_plan_html(plan)
 
 def export_ics(state):
     if not state:
@@ -428,7 +583,7 @@ with gr.Blocks(title="Bills Buddy (Gradio)", css=CUSTOM_CSS) as demo:
                 text_input = gr.Textbox(label="Or paste bill text", lines=8, placeholder="Paste bill text here...")
                 btn = gr.Button("Understand", variant="primary")
             with gr.Column(scale=1):
-                summary_html = gr.HTML(value="")
+                summary_html = gr.HTML(value="<div class='bb-card'>Bill summary will appear here after extraction.</div>")
                 error_md = gr.Markdown(value="")
         with gr.Accordion("Full extracted JSON", open=False):
             full_json = gr.JSON(value={})
@@ -446,7 +601,7 @@ with gr.Blocks(title="Bills Buddy (Gradio)", css=CUSTOM_CSS) as demo:
             hour = gr.Number(label="Hour (0-23)", value=9, precision=0)
         with gr.Row():
             smart_btn = gr.Button("Smart Schedule (use extracted due date)")
-            plan_out = gr.Textbox(label="Plan JSON", lines=10)
+            plan_out = gr.HTML(label="Plan")
         smart_btn.click(smart_schedule, inputs=[state, user_id, bill_id, offsets, hour], outputs=[plan_out])
 
         with gr.Row():
