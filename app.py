@@ -225,6 +225,12 @@ def understand_bill(file, text_input, state):
 
     summary_md = make_summary_md(data)
     state = data
+    missing_all = not any([data.get("provider"), data.get("amount"), data.get("currency"), data.get("due_date")])
+    if missing_all and data.get("text_preview"):
+        preview = data["text_preview"][:1200]
+        # Put the OCR text into the “Errors” box so you can see what was read
+        return summary_md, "⚠️ Couldn’t find key fields. OCR saw:\n\n```\n" + preview + "\n```", data, state
+
     HISTORY.append({
         "provider": data.get("provider"),
         "due_date": data.get("due_date"),
