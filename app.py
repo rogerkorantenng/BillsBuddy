@@ -25,9 +25,9 @@ except Exception:
     pass
 
 # --- Config (adjust to your API Gateway stage) ---
-API_BASE = "https://2uv2ia4lt1.execute-api.us-east-1.amazonaws.com/prod"
-UPLOAD_BUCKET = "billsbuddy-uploads-test"
-REGION = "us-east-1"
+API_BASE = os.getenv("API_BASE")
+UPLOAD_BUCKET = os.getenv("UPLOAD_BUCKET")
+REGION = os.getenv("REGION")
 
 PRESIGN_URL    = f"{API_BASE}/tools/presign" if API_BASE else None
 EXTRACT_URL    = f"{API_BASE}/tools/extract"  if API_BASE else None
